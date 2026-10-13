@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      rel="stylesheet"
+      href="/content/d16433b43036785657eba7cc36f6be0c503e399bd28309557f765b5d2ee90eb9i0"
+    />
+  </head>
+  <body>
+    <div id="c">
+      <img id="disc" />
+      <canvas id="canvas" width="576" height="576"></canvas>
+    </div>
+
+    <script src="/content/2d06a7741cf4a988e81c550e4b3973c95f7db87185b1fe676dfa763f9b424272i0"></script>
+    <script src="/content/7b1cd1931c8ebe149b286144b70e1c0150e9b35babae36b7db18a1d259ba8321i0"></script>
+    <script src="/content/277544cdd47ddc3edfac8b622b2849cf294ab3957f1113edcac4b1292a6ef528i0"></script>
+    <script src="/content/e3f9e8545cc3a34acd1a13b44e8a560efbcd55dc19cff15dbedf032ab0bf5a02i0"></script>
+    <script>
+      const track = "/content/4bdd3d72da1fe299ed89cd2c71b29b901807d1b3d41d447aec8a5383eacddf84i0";
+      async function init() {
+        document
+          .getElementById("canvas")
+          .replaceWith(document.getElementById("canvas").cloneNode(true));
+
+        document.getElementById("canvas").addEventListener("click", () => {
+          slideOffCanvas();
+        });
+
+        let { canvas, trk, ctx } = await pressRecord(
+          track,
+          "#000",
+          "#fafafa",
+          0.002686,
+          149,
+        );
+
+        canvas = await createLabel(
+          ctx,
+          canvas,
+          "/content/04c2408b42e77f8c8472e75782fc969a85d57126e8d724cf3a4e53c00b6f49a3i0",
+          "/content/2fd5009098ddf180e582e12ce837a2ad57882e018ec7c7d14936458364272f34i0",
+          "#fafafa",
+          "#000",
+          "#ff2c2c",
+          "Westside",
+          "Lori Asha",
+          "1,809,023,032,520,496",
+          "849,187",
+          "71847905",
+          "",
+          "(L A Edmond, J Ralphs)",
+          "(Vocal & arr. L A \nEdmond / W Rendle\nJ Rendle / J Ralphs)",
+          "2024",
+          "",
+          0,
+          "3:29",
+          149,
+        );
+
+        const bmpData = createBmpFromCanvas(canvas);
+        const bmpURL = URL.createObjectURL(bmpData);
+        document.getElementById("disc").src = bmpURL;
+      }
+
+      init();
+
+      recordSleeve(track, 0);
+    </script>
+  </body>
+</html>
