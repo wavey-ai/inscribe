@@ -215,15 +215,15 @@ pub struct BroadcastReport {
 
 /// Sends the commit and then each reveal that the network does not have. The
 /// function sets the `broadcast` flags in `run`; store the run afterwards.
-/// A repeat call is safe: the function checks each transaction first.
+/// A repeat call is safe: the function asks the network about each
+/// transaction first. It does not trust the stored flags, because a mempool
+/// can drop a transaction after it accepts it.
 pub async fn broadcast<H: Http>(client: &Client<H>, run: &mut Run) -> Result<BroadcastReport> {
   let commit_txid = run.commit.txid.parse()?;
-  if !run.commit.broadcast {
-    if client.tx_status(&commit_txid).await?.is_none() {
-      client.broadcast(&run.commit.transaction()?).await?;
-    }
-    run.commit.broadcast = true;
+  if client.tx_status(&commit_txid).await?.is_none() {
+    client.broadcast(&run.commit.transaction()?).await?;
   }
+  run.commit.broadcast = true;
 
   let mut report = BroadcastReport {
     commit_txid: run.commit.txid.clone(),
@@ -231,10 +231,6 @@ pub async fn broadcast<H: Http>(client: &Client<H>, run: &mut Run) -> Result<Bro
     failures: Vec::new(),
   };
   for record in run.reveals.iter_mut() {
-    if record.tx.broadcast {
-      report.revealed.push(record.inscription_id.clone());
-      continue;
-    }
     let txid = record.tx.txid.parse()?;
     let result = match client.tx_status(&txid).await {
       Ok(Some(_)) => Ok(()),

@@ -207,10 +207,21 @@ impl<H: Http> Client<H> {
   }
 
   /// Returns None when the endpoint does not know the transaction.
+  ///
+  /// The client reads /tx/<txid>, not /tx/<txid>/status: mempool.space
+  /// answers /status with HTTP 200 and {"confirmed":false} for a transaction
+  /// that it has never seen, but answers /tx/<txid> with HTTP 404.
   pub async fn tx_status(&self, txid: &Txid) -> Result<Option<TxStatus>> {
-    self
-      .get_optional(&format!("{}/tx/{txid}/status", self.endpoints.esplora))
-      .await
+    #[derive(Deserialize)]
+    struct TxWithStatus {
+      status: TxStatus,
+    }
+    Ok(
+      self
+        .get_optional::<TxWithStatus>(&format!("{}/tx/{txid}", self.endpoints.esplora))
+        .await?
+        .map(|tx| tx.status),
+    )
   }
 
   pub async fn outspend(&self, outpoint: &OutPoint) -> Result<Outspend> {

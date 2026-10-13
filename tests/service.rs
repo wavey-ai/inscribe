@@ -34,6 +34,14 @@ impl MockHttp {
 
 impl Http for MockHttp {
   async fn get(&self, url: &str) -> Result<Response> {
+    // mempool.space answers /tx/<txid>/status with HTTP 200 for every txid,
+    // also for a transaction that it has never seen.
+    if url.ends_with("/status") && !self.routes.borrow().contains_key(url) {
+      return Ok(Response {
+        status: 200,
+        body: br#"{"confirmed":false}"#.to_vec(),
+      });
+    }
     let (status, body) = self
       .routes
       .borrow()
@@ -59,9 +67,9 @@ impl Http for MockHttp {
     let tx: Transaction = deserialize_hex(&body)?;
     let txid = tx.compute_txid();
     self.route(
-      &format!("{ESPLORA}/tx/{txid}/status"),
+      &format!("{ESPLORA}/tx/{txid}"),
       200,
-      r#"{"confirmed":false}"#,
+      &format!(r#"{{"txid":"{txid}","status":{{"confirmed":false}}}}"#),
     );
     self.broadcasts.borrow_mut().push(tx);
     Ok(Response {
@@ -222,6 +230,18 @@ fn broadcast_sends_commit_then_reveals_and_is_idempotent() {
   // A second call finds every transaction and sends nothing.
   pollster::block_on(service::broadcast(&client, &mut run)).unwrap();
   assert_eq!(client_broadcasts(&client).len(), 3);
+
+  // A flag that says "broadcast" does not stop a resend of a transaction that
+  // the network does not have, for example after a mempool eviction.
+  let evicted = run.reveals[1].tx.txid.clone();
+  http(&client)
+    .routes
+    .borrow_mut()
+    .remove(&format!("{ESPLORA}/tx/{evicted}"));
+  assert!(run.reveals[1].tx.broadcast);
+  pollster::block_on(service::broadcast(&client, &mut run)).unwrap();
+  assert_eq!(client_broadcasts(&client).len(), 4);
+  assert_eq!(client_broadcasts(&client)[3], evicted);
 
   let status = pollster::block_on(service::status(&client, &run)).unwrap();
   assert_eq!(status.commit, TxState::Mempool);
