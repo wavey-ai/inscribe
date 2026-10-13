@@ -2,7 +2,7 @@
 
 ## Verification
 
-- [x] Do an end-to-end run on signet. The Worker under `wrangler dev` created, stored, and broadcast run `1791889579-775a85035bbb289f` (commit `775a85035bbb289fb55e20a823d84ffb7d5d165128a4b6ff1e8eaac88964280d`, inscription `23b297437904b5e1202bd505297fbe3c28e6a0a1a488d7de10bd4bc9a78b3fa9i0`).
+- [x] Do an end-to-end run on signet. The Worker under `wrangler dev` created, stored, and broadcast run `1791889579-775a85035bbb289f` (commit `775a85035bbb289fb55e20a823d84ffb7d5d165128a4b6ff1e8eaac88964280d`, inscription `23b297437904b5e1202bd505297fbe3c28e6a0a1a488d7de10bd4bc9a78b3fa9i0`). Both transactions confirmed in signet block 326195.
 - [ ] Do a first mainnet run with one small file at a low fee rate. Make sure that ordinals.com shows the inscription with the correct content type.
 
 ## Inscription features
