@@ -1,43 +1,64 @@
-use std::time::Duration;
+//! Chain data and broadcast through an Esplora endpoint (for example
+//! mempool.space) and an ord server. The client is async and generic over an
+//! [`Http`] backend, so the same code runs with reqwest on a host and with the
+//! Fetch API on Cloudflare Workers.
 
 use anyhow::{Context, Result, anyhow, bail};
-use bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
+use bitcoin::{Address, Amount, Network, OutPoint, Transaction, Txid};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
-const USER_AGENT: &str = concat!("wavey-inscribe/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("wavey-inscribe/", env!("CARGO_PKG_VERSION"));
 
-pub fn default_esplora_url(network: Network) -> Option<&'static str> {
-  match network {
-    Network::Bitcoin => Some("https://mempool.space/api"),
-    Network::Signet => Some("https://mempool.space/signet/api"),
-    Network::Testnet4 => Some("https://mempool.space/testnet4/api"),
-    _ => None,
+/// An HTTP response: the status code and the body.
+pub struct Response {
+  pub status: u16,
+  pub body: Vec<u8>,
+}
+
+impl Response {
+  pub fn is_success(&self) -> bool {
+    (200..300).contains(&self.status)
+  }
+
+  pub fn text(&self) -> String {
+    String::from_utf8_lossy(&self.body).into_owned()
   }
 }
 
-pub fn default_ord_url(network: Network) -> Option<&'static str> {
-  match network {
-    Network::Bitcoin => Some("https://ordinals.com"),
-    _ => None,
+/// The HTTP operations that the client needs. A Workers backend implements
+/// this trait with `worker::Fetch`.
+#[allow(async_fn_in_trait)]
+pub trait Http {
+  async fn get(&self, url: &str) -> Result<Response>;
+  async fn post(&self, url: &str, body: String) -> Result<Response>;
+}
+
+#[derive(Clone, Debug)]
+pub struct Endpoints {
+  /// The Esplora REST base URL, for example https://mempool.space/api.
+  pub esplora: String,
+  /// The ord server base URL, for example https://ordinals.com.
+  pub ord: Option<String>,
+}
+
+impl Endpoints {
+  /// mempool.space for each public network, and ordinals.com on mainnet.
+  pub fn defaults(network: Network) -> Option<Self> {
+    let esplora = match network {
+      Network::Bitcoin => "https://mempool.space/api",
+      Network::Signet => "https://mempool.space/signet/api",
+      Network::Testnet4 => "https://mempool.space/testnet4/api",
+      _ => return None,
+    };
+    Some(Self {
+      esplora: esplora.into(),
+      ord: (network == Network::Bitcoin).then(|| "https://ordinals.com".into()),
+    })
   }
 }
 
-fn client() -> Result<reqwest::blocking::Client> {
-  Ok(
-    reqwest::blocking::Client::builder()
-      .user_agent(USER_AGENT)
-      .timeout(Duration::from_secs(60))
-      .build()?,
-  )
-}
-
-/// An Esplora REST endpoint, for example mempool.space.
-pub struct Esplora {
-  base: String,
-  client: reqwest::blocking::Client,
-}
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct Utxo {
   pub txid: Txid,
   pub vout: u32,
@@ -55,19 +76,19 @@ impl Utxo {
   }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct TxStatus {
   pub confirmed: bool,
   pub block_height: Option<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct Outspend {
   pub spent: bool,
   pub txid: Option<Txid>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendedFees {
   pub fastest_fee: f64,
@@ -77,7 +98,7 @@ pub struct RecommendedFees {
   pub minimum_fee: f64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct Prices {
   #[serde(rename = "USD")]
   pub usd: f64,
@@ -85,97 +106,7 @@ pub struct Prices {
   pub gbp: f64,
 }
 
-impl Esplora {
-  pub fn new(base: &str) -> Result<Self> {
-    Ok(Self {
-      base: base.trim_end_matches('/').to_string(),
-      client: client()?,
-    })
-  }
-
-  fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-    let url = format!("{}{path}", self.base);
-    let response = self
-      .client
-      .get(&url)
-      .send()
-      .with_context(|| format!("GET {url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-      bail!(
-        "GET {url}: HTTP {status}: {}",
-        response.text().unwrap_or_default()
-      );
-    }
-    response.json().with_context(|| format!("decode {url}"))
-  }
-
-  pub fn utxos(&self, address: &bitcoin::Address) -> Result<Vec<Utxo>> {
-    self.get(&format!("/address/{address}/utxo"))
-  }
-
-  pub fn recommended_fees(&self) -> Result<RecommendedFees> {
-    self.get("/v1/fees/recommended")
-  }
-
-  /// Exchange rates. mempool.space publishes these for mainnet only.
-  pub fn prices(&self) -> Result<Prices> {
-    self.get("/v1/prices")
-  }
-
-  /// Returns None when the endpoint does not know the transaction.
-  pub fn tx_status(&self, txid: &Txid) -> Result<Option<TxStatus>> {
-    let url = format!("{}/tx/{txid}/status", self.base);
-    let response = self
-      .client
-      .get(&url)
-      .send()
-      .with_context(|| format!("GET {url}"))?;
-    match response.status() {
-      status if status == reqwest::StatusCode::NOT_FOUND => Ok(None),
-      status if status.is_success() => Ok(Some(response.json()?)),
-      status => bail!(
-        "GET {url}: HTTP {status}: {}",
-        response.text().unwrap_or_default()
-      ),
-    }
-  }
-
-  pub fn outspend(&self, outpoint: &OutPoint) -> Result<Outspend> {
-    self.get(&format!("/tx/{}/outspend/{}", outpoint.txid, outpoint.vout))
-  }
-
-  pub fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-    let url = format!("{}/tx", self.base);
-    let hex = bitcoin::consensus::encode::serialize_hex(tx);
-    let response = self
-      .client
-      .post(&url)
-      .body(hex)
-      .send()
-      .with_context(|| format!("POST {url}"))?;
-    let status = response.status();
-    let text = response.text().unwrap_or_default();
-    if !status.is_success() {
-      bail!(
-        "broadcast of {} failed: HTTP {status}: {text}",
-        tx.compute_txid()
-      );
-    }
-    text
-      .trim()
-      .parse()
-      .map_err(|err| anyhow!("broadcast returned {text:?}: {err}"))
-  }
-}
-
-/// An ord server. The client uses the recursive endpoint /r/utxo, which
-/// ordinals.com serves when its JSON API is off.
-pub struct Ord {
-  base: String,
-  client: reqwest::blocking::Client,
-}
-
+/// The answer of the ord recursive endpoint /r/utxo/<outpoint>.
 #[derive(Clone, Debug, Deserialize)]
 pub struct OrdUtxo {
   #[serde(default)]
@@ -200,32 +131,169 @@ impl OrdUtxo {
   }
 }
 
-impl Ord {
-  pub fn new(base: &str) -> Result<Self> {
+pub struct Client<H> {
+  http: H,
+  endpoints: Endpoints,
+}
+
+impl<H: Http> Client<H> {
+  pub fn new(http: H, endpoints: Endpoints) -> Self {
+    let trim = |url: &str| url.trim_end_matches('/').to_string();
+    Self {
+      http,
+      endpoints: Endpoints {
+        esplora: trim(&endpoints.esplora),
+        ord: endpoints.ord.as_deref().map(trim),
+      },
+    }
+  }
+
+  pub fn http(&self) -> &H {
+    &self.http
+  }
+
+  pub fn endpoints(&self) -> &Endpoints {
+    &self.endpoints
+  }
+
+  async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
+    let response = self
+      .http
+      .get(url)
+      .await
+      .with_context(|| format!("GET {url}"))?;
+    if !response.is_success() {
+      bail!("GET {url}: HTTP {}: {}", response.status, response.text());
+    }
+    serde_json::from_slice(&response.body).with_context(|| format!("decode {url}"))
+  }
+
+  /// GET that maps HTTP 404 to None.
+  async fn get_optional<T: DeserializeOwned>(&self, url: &str) -> Result<Option<T>> {
+    let response = self
+      .http
+      .get(url)
+      .await
+      .with_context(|| format!("GET {url}"))?;
+    match response.status {
+      404 => Ok(None),
+      _ if response.is_success() => Ok(Some(
+        serde_json::from_slice(&response.body).with_context(|| format!("decode {url}"))?,
+      )),
+      status => bail!("GET {url}: HTTP {status}: {}", response.text()),
+    }
+  }
+
+  pub async fn utxos(&self, address: &Address) -> Result<Vec<Utxo>> {
+    self
+      .get_json(&format!(
+        "{}/address/{address}/utxo",
+        self.endpoints.esplora
+      ))
+      .await
+  }
+
+  pub async fn recommended_fees(&self) -> Result<RecommendedFees> {
+    self
+      .get_json(&format!("{}/v1/fees/recommended", self.endpoints.esplora))
+      .await
+  }
+
+  /// Exchange rates. mempool.space publishes these for mainnet only.
+  pub async fn prices(&self) -> Result<Prices> {
+    self
+      .get_json(&format!("{}/v1/prices", self.endpoints.esplora))
+      .await
+  }
+
+  /// Returns None when the endpoint does not know the transaction.
+  pub async fn tx_status(&self, txid: &Txid) -> Result<Option<TxStatus>> {
+    self
+      .get_optional(&format!("{}/tx/{txid}/status", self.endpoints.esplora))
+      .await
+  }
+
+  pub async fn outspend(&self, outpoint: &OutPoint) -> Result<Outspend> {
+    self
+      .get_json(&format!(
+        "{}/tx/{}/outspend/{}",
+        self.endpoints.esplora, outpoint.txid, outpoint.vout
+      ))
+      .await
+  }
+
+  pub async fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
+    let url = format!("{}/tx", self.endpoints.esplora);
+    let response = self
+      .http
+      .post(&url, bitcoin::consensus::encode::serialize_hex(tx))
+      .await
+      .with_context(|| format!("POST {url}"))?;
+    let text = response.text();
+    if !response.is_success() {
+      bail!(
+        "broadcast of {} failed: HTTP {}: {text}",
+        tx.compute_txid(),
+        response.status
+      );
+    }
+    text
+      .trim()
+      .parse()
+      .map_err(|err| anyhow!("broadcast returned {text:?}: {err}"))
+  }
+
+  pub fn has_ord(&self) -> bool {
+    self.endpoints.ord.is_some()
+  }
+
+  /// Returns None when the ord server has not indexed the output. The client
+  /// uses the recursive endpoint, which ordinals.com serves when its JSON API
+  /// is off.
+  pub async fn ord_utxo(&self, outpoint: &OutPoint) -> Result<Option<OrdUtxo>> {
+    let ord = self
+      .endpoints
+      .ord
+      .as_deref()
+      .ok_or_else(|| anyhow!("no ord server is set"))?;
+    self.get_optional(&format!("{ord}/r/utxo/{outpoint}")).await
+  }
+}
+
+/// A blocking reqwest backend for native programs. Its futures complete
+/// without suspension, so a minimal executor such as `pollster` runs them.
+#[cfg(feature = "native")]
+pub struct ReqwestHttp {
+  client: reqwest::blocking::Client,
+}
+
+#[cfg(feature = "native")]
+impl ReqwestHttp {
+  pub fn new() -> Result<Self> {
     Ok(Self {
-      base: base.trim_end_matches('/').to_string(),
-      client: client()?,
+      client: reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?,
     })
   }
 
-  /// Returns None when the ord server has not indexed the output.
-  pub fn utxo(&self, outpoint: &OutPoint) -> Result<Option<OrdUtxo>> {
-    let url = format!("{}/r/utxo/{outpoint}", self.base);
-    let response = self
-      .client
-      .get(&url)
-      .send()
-      .with_context(|| format!("GET {url}"))?;
-    match response.status() {
-      status if status == reqwest::StatusCode::NOT_FOUND => Ok(None),
-      status if status.is_success() => Ok(Some(
-        response.json().with_context(|| format!("decode {url}"))?,
-      )),
-      status => bail!(
-        "GET {url}: HTTP {status}: {}",
-        response.text().unwrap_or_default()
-      ),
-    }
+  fn finish(response: reqwest::blocking::Response) -> Result<Response> {
+    Ok(Response {
+      status: response.status().as_u16(),
+      body: response.bytes()?.to_vec(),
+    })
+  }
+}
+
+#[cfg(feature = "native")]
+impl Http for ReqwestHttp {
+  async fn get(&self, url: &str) -> Result<Response> {
+    Self::finish(self.client.get(url).send()?)
+  }
+
+  async fn post(&self, url: &str, body: String) -> Result<Response> {
+    Self::finish(self.client.post(url).body(body).send()?)
   }
 }
 

@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inscribe-worker",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-06-04",
+  "workers_dev": false,
+  "vars": {
+    "INSCRIBE_NETWORK": "signet"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "INSCRIBE_RUNS",
+      "id": "replace-with-the-id-from-wrangler-kv-namespace-create"
+    }
+  ],
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "observability": {
+    "enabled": true
+  },
+  "build": {
+    "command": "worker-build --release --no-panic-recovery"
+  }
+}

@@ -2,7 +2,7 @@
 
 ## Verification
 
-- [ ] Do an end-to-end run on signet. The funding address needs signet coins from a faucet.
+- [x] Do an end-to-end run on signet. The Worker under `wrangler dev` created, stored, and broadcast run `1791889579-775a85035bbb289f` (commit `775a85035bbb289fb55e20a823d84ffb7d5d165128a4b6ff1e8eaac88964280d`, inscription `23b297437904b5e1202bd505297fbe3c28e6a0a1a488d7de10bd4bc9a78b3fa9i0`).
 - [ ] Do a first mainnet run with one small file at a low fee rate. Make sure that ordinals.com shows the inscription with the correct content type.
 
 ## Inscription features
@@ -24,3 +24,9 @@
 - [ ] Fee bumps for a stuck reveal (RBF or CPFP).
 - [ ] A second Esplora endpoint as a fallback for the broadcast.
 - [ ] Runs of more than 24 files, with a commit transaction for each group of 24.
+
+## Worker
+
+- [ ] A lock for run creation, for example a Durable Object, so that two runs cannot select the same funding output.
+- [ ] Multipart uploads as an alternative to base64 JSON bodies.
+- [ ] A deployment with a route on a wavey.ai domain.

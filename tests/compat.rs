@@ -123,7 +123,7 @@ fn test_plan(bodies: Vec<Vec<u8>>, funding: Vec<u64>, rate: f64) -> (Wallet, pla
   let secp = Secp256k1::new();
   let destination = Address::p2tr(
     &secp,
-    Keypair::new(&secp, &mut bitcoin::secp256k1::rand::thread_rng())
+    Keypair::new(&secp, &mut rand_core::OsRng)
       .x_only_public_key()
       .0,
     None,
@@ -159,6 +159,7 @@ fn test_plan(bodies: Vec<Vec<u8>>, funding: Vec<u64>, rate: f64) -> (Wallet, pla
     &utxos,
     inscriptions,
     &params,
+    &mut rand_core::OsRng,
   )
   .unwrap();
   (wallet, built, params)
@@ -230,6 +231,7 @@ fn recovery_spends_commit_outputs_by_key_path() {
     &commits,
     &wallet.address(),
     FeeRate::new(3.0).unwrap(),
+    &mut rand_core::OsRng,
   )
   .unwrap();
   let prevouts: Vec<TxOut> = commits
@@ -279,7 +281,15 @@ fn insufficient_funds_and_oversize_bodies_are_errors() {
     None,
   )
   .unwrap();
-  let err = plan::build(wallet.secp(), wallet.keypair(), &utxo, vec![small], &params).unwrap_err();
+  let err = plan::build(
+    wallet.secp(),
+    wallet.keypair(),
+    &utxo,
+    vec![small],
+    &params,
+    &mut rand_core::OsRng,
+  )
+  .unwrap_err();
   assert!(err.to_string().contains("needs at least"), "{err}");
 
   let huge = Inscription::new(
@@ -290,7 +300,15 @@ fn insufficient_funds_and_oversize_bodies_are_errors() {
     None,
   )
   .unwrap();
-  let err = plan::build(wallet.secp(), wallet.keypair(), &utxo, vec![huge], &params).unwrap_err();
+  let err = plan::build(
+    wallet.secp(),
+    wallet.keypair(),
+    &utxo,
+    vec![huge],
+    &params,
+    &mut rand_core::OsRng,
+  )
+  .unwrap_err();
   assert!(err.to_string().contains("standard limit"), "{err}");
 
   let low_postage = Params {
@@ -311,6 +329,7 @@ fn insufficient_funds_and_oversize_bodies_are_errors() {
     &utxo,
     vec![tiny],
     &low_postage,
+    &mut rand_core::OsRng,
   )
   .unwrap_err();
   assert!(err.to_string().contains("dust"), "{err}");

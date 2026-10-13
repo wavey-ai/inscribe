@@ -3,6 +3,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::key::{Keypair, TapTweak, UntweakedKeypair};
 use bitcoin::policy::MAX_STANDARD_TX_WEIGHT;
+use bitcoin::secp256k1::rand::{CryptoRng, Rng};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey, Signing, Verification};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::{
@@ -257,12 +258,15 @@ fn select(
   bail!("the wallet has {total} in usable outputs; this plan needs at least {needed}",)
 }
 
-pub fn build<C: Signing + Verification>(
+/// Builds and signs a commit transaction and one reveal transaction for each
+/// inscription. `rng` makes the ephemeral commit keys and the signature nonces.
+pub fn build<C: Signing + Verification, R: Rng + CryptoRng>(
   secp: &Secp256k1<C>,
   funding_keypair: &Keypair,
   funding_utxos: &[FundingUtxo],
   inscriptions: Vec<Inscription>,
   params: &Params,
+  rng: &mut R,
 ) -> Result<Plan> {
   ensure!(!inscriptions.is_empty(), "no files to inscribe");
   ensure!(
@@ -271,10 +275,12 @@ pub fn build<C: Signing + Verification>(
     inscriptions.len()
   );
 
-  let mut rng = bitcoin::secp256k1::rand::thread_rng();
   let templates = inscriptions
     .into_iter()
-    .map(|inscription| template(secp, inscription, params, Keypair::new(secp, &mut rng)))
+    .map(|inscription| {
+      let keypair = Keypair::new(secp, rng);
+      template(secp, inscription, params, keypair)
+    })
     .collect::<Result<Vec<_>>>()?;
 
   let commit_outputs: Vec<TxOut> = templates
@@ -332,6 +338,7 @@ pub fn build<C: Signing + Verification>(
     &mut commit,
     &commit_prevouts,
     &funding_keypair.tap_tweak(secp, None).to_keypair(),
+    rng,
   )?;
   let commit_txid = commit.compute_txid();
 
@@ -346,6 +353,7 @@ pub fn build<C: Signing + Verification>(
         OutPoint::new(commit_txid, vout as u32),
         &commit_output,
         params,
+        rng,
       )?;
       Ok(Reveal {
         inscription: template.inscription,
@@ -368,12 +376,13 @@ pub fn build<C: Signing + Verification>(
   })
 }
 
-fn sign_reveal<C: Signing + Verification>(
+fn sign_reveal<C: Signing + Verification, R: Rng + CryptoRng>(
   secp: &Secp256k1<C>,
   template: &RevealTemplate,
   commit_outpoint: OutPoint,
   commit_output: &TxOut,
   params: &Params,
+  rng: &mut R,
 ) -> Result<Transaction> {
   let mut tx = reveal_skeleton(
     commit_outpoint,
@@ -389,9 +398,10 @@ fn sign_reveal<C: Signing + Verification>(
     TapLeafHash::from_script(&template.script, LeafVersion::TapScript),
     TapSighashType::Default,
   )?;
-  let signature = secp.sign_schnorr(
+  let signature = secp.sign_schnorr_with_rng(
     &Message::from_digest(sighash.to_byte_array()),
     &template.keypair,
+    rng,
   );
 
   let witness = &mut tx.input[0].witness;
@@ -409,11 +419,12 @@ fn sign_reveal<C: Signing + Verification>(
 }
 
 /// Signs every input as a BIP341 key-path spend with one tweaked key.
-pub fn sign_key_path<C: Signing>(
+pub fn sign_key_path<C: Signing, R: Rng + CryptoRng>(
   secp: &Secp256k1<C>,
   tx: &mut Transaction,
   prevouts: &[TxOut],
   tweaked: &Keypair,
+  rng: &mut R,
 ) -> Result<()> {
   let mut cache = SighashCache::new(&mut *tx);
   let mut witnesses = Vec::new();
@@ -423,7 +434,8 @@ pub fn sign_key_path<C: Signing>(
       &Prevouts::All(prevouts),
       TapSighashType::Default,
     )?;
-    let signature = secp.sign_schnorr(&Message::from_digest(sighash.to_byte_array()), tweaked);
+    let signature =
+      secp.sign_schnorr_with_rng(&Message::from_digest(sighash.to_byte_array()), tweaked, rng);
     witnesses.push(Witness::p2tr_key_spend(&Signature {
       signature,
       sighash_type: TapSighashType::Default,
@@ -438,11 +450,12 @@ pub fn sign_key_path<C: Signing>(
 /// Spends unrevealed commit outputs back to the wallet with the key path of
 /// each commit output. The key path uses the ephemeral key tweaked with the
 /// script tree root.
-pub fn build_recovery<C: Signing + Verification>(
+pub fn build_recovery<C: Signing + Verification, R: Rng + CryptoRng>(
   secp: &Secp256k1<C>,
   commits: &[(OutPoint, TxOut, SecretKey, TapNodeHash)],
   destination: &Address,
   rate: FeeRate,
+  rng: &mut R,
 ) -> Result<(Transaction, Amount)> {
   ensure!(!commits.is_empty(), "no commit outputs to recover");
 
@@ -486,9 +499,10 @@ pub fn build_recovery<C: Signing + Verification>(
       &Prevouts::All(&prevouts),
       TapSighashType::Default,
     )?;
-    let signature = secp.sign_schnorr(
+    let signature = secp.sign_schnorr_with_rng(
       &Message::from_digest(sighash.to_byte_array()),
       &keypair.to_keypair(),
+      rng,
     );
     witnesses.push(Witness::p2tr_key_spend(&Signature {
       signature,
@@ -500,4 +514,91 @@ pub fn build_recovery<C: Signing + Verification>(
   }
 
   Ok((tx, fee))
+}
+
+/// The size and fee of one reveal in an estimate.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RevealEstimate {
+  pub body_bytes: usize,
+  pub compressed: bool,
+  pub vsize: u64,
+  pub fee_sat: u64,
+}
+
+/// A cost estimate. The commit part assumes one P2TR funding input and one
+/// P2TR change output.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Estimate {
+  pub reveals: Vec<RevealEstimate>,
+  pub commit_vsize: u64,
+  pub commit_fee_sat: u64,
+  pub total_fee_sat: u64,
+  pub total_postage_sat: u64,
+}
+
+/// Estimates the network fees of a run. The sizes do not depend on the keys,
+/// so a fixed key stands in for the ephemeral keys and the addresses.
+pub fn estimate<C: Signing + Verification>(
+  secp: &Secp256k1<C>,
+  inscriptions: Vec<Inscription>,
+  postage: Amount,
+  commit_fee_rate: FeeRate,
+  reveal_fee_rate: FeeRate,
+) -> Result<Estimate> {
+  ensure!(!inscriptions.is_empty(), "no files to inscribe");
+  let keypair = Keypair::from_seckey_slice(secp, &[1; 32]).expect("valid secret key");
+  let p2tr = ScriptBuf::new_p2tr(secp, keypair.x_only_public_key().0, None);
+  let placeholder = Address::from_script(&p2tr, bitcoin::Network::Bitcoin).expect("P2TR address");
+  let params = Params {
+    destination: placeholder.clone(),
+    change: placeholder,
+    postage,
+    commit_fee_rate,
+    reveal_fee_rate,
+  };
+
+  let templates = inscriptions
+    .into_iter()
+    .map(|inscription| template(secp, inscription, &params, keypair))
+    .collect::<Result<Vec<_>>>()?;
+
+  let mut outputs: Vec<TxOut> = templates
+    .iter()
+    .map(|template| TxOut {
+      value: template.fee + postage,
+      script_pubkey: template.commit_script_pubkey.clone(),
+    })
+    .collect();
+  outputs.push(TxOut {
+    value: Amount::ZERO,
+    script_pubkey: p2tr,
+  });
+  let commit_vsize = commit_vsize(1, &outputs);
+  let commit_fee = commit_fee_rate.fee(commit_vsize);
+
+  let reveals: Vec<RevealEstimate> = templates
+    .iter()
+    .map(|template| {
+      let output = TxOut {
+        value: postage,
+        script_pubkey: params.destination.script_pubkey(),
+      };
+      let vsize = reveal_vsize(&template.script, &template.control_block, &output);
+      RevealEstimate {
+        body_bytes: template.inscription.body.len(),
+        compressed: template.inscription.content_encoding.is_some(),
+        vsize,
+        fee_sat: template.fee.to_sat(),
+      }
+    })
+    .collect();
+
+  let reveal_fees: u64 = reveals.iter().map(|reveal| reveal.fee_sat).sum();
+  Ok(Estimate {
+    total_fee_sat: commit_fee.to_sat() + reveal_fees,
+    total_postage_sat: postage.to_sat() * reveals.len() as u64,
+    commit_vsize,
+    commit_fee_sat: commit_fee.to_sat(),
+    reveals,
+  })
 }

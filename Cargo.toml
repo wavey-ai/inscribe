@@ -1,21 +1,44 @@
 [package]
 name = "inscribe"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Create Bitcoin ordinal inscriptions with a local wallet and public Esplora and ord endpoints"
+description = "Create Bitcoin ordinal inscriptions with a local key. Runs natively and on Cloudflare Workers."
+license = "MIT"
+repository = "https://github.com/wavey-ai/inscribe"
 publish = false
+
+[features]
+default = ["cli"]
+# File-system helpers and a blocking reqwest HTTP backend.
+native = ["dep:reqwest"]
+# The `inscribe` command-line program.
+cli = ["native", "dep:clap", "dep:pollster"]
+
+[[bin]]
+name = "inscribe"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 anyhow = "1.0"
-bip39 = { version = "2.1", features = ["rand"] }
-bitcoin = { version = "0.32.5", features = ["rand-std", "serde"] }
+bip39 = { version = "2.1", default-features = false, features = ["std"] }
+bitcoin = { version = "0.32.5", features = ["rand", "serde"] }
 brotli = "8.0.1"
-clap = { version = "4.5", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+pollster = { version = "0.4", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# Workers expose crypto.getRandomValues; getrandom reaches it through the
+# "js" backend.
+getrandom = { version = "0.2", features = ["js"] }
+
 [dev-dependencies]
 bitcoinconsensus = "0.106.0"
+pollster = "0.4"
 tempfile = "3"

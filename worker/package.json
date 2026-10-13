@@ -1,0 +1,17 @@
+{
+  "name": "@wavey-ai/inscribe-worker",
+  "version": "0.1.0",
+  "description": "A Cloudflare Worker that exposes the inscribe library as an authenticated JSON API.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "worker-build --release --no-panic-recovery",
+    "dev": "wrangler dev --config wrangler.jsonc",
+    "deploy": "wrangler deploy --config wrangler.jsonc",
+    "deploy:dry-run": "wrangler deploy --config wrangler.jsonc --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.150.0"
+  }
+}

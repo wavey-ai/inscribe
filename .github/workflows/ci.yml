@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  wasm:
+    runs-on: ubuntu-latest
+    env:
+      # secp256k1-sys compiles C code; the runner's LLVM clang targets wasm32.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - run: cargo build --lib --no-default-features --target wasm32-unknown-unknown --release
+      - run: cargo build --manifest-path worker/Cargo.toml --target wasm32-unknown-unknown --release

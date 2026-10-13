@@ -1,16 +1,18 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::address::NetworkUnchecked;
-use bitcoin::{Address, Amount, Network, OutPoint};
+use bitcoin::{Address, Amount, Network};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use rand_core::OsRng;
 
-use inscribe::api::{self, Esplora, Ord};
-use inscribe::envelope::Inscription;
-use inscribe::plan::{self, FeeRate, FundingUtxo, Params};
-use inscribe::run::{self, Run, RunInputs};
-use inscribe::wallet::Wallet;
+use inscribe::api::{Client, Endpoints, ReqwestHttp};
+use inscribe::plan::{self, FeeRate};
+use inscribe::run::Run;
+use inscribe::service::{self, CreateOptions, FileInput, SkipReason, TxState};
+use inscribe::wallet::{Wallet, store};
 
 #[derive(Parser)]
 #[command(
@@ -63,7 +65,7 @@ impl Chain {
     }
   }
 
-  fn dir(self) -> &'static str {
+  fn name(self) -> &'static str {
     match self {
       Chain::Bitcoin => "bitcoin",
       Chain::Signet => "signet",
@@ -138,6 +140,16 @@ struct FeeArgs {
   commit_fee_rate: Option<f64>,
 }
 
+impl FeeArgs {
+  fn reveal(&self) -> Result<Option<FeeRate>> {
+    self.fee_rate.map(FeeRate::new).transpose()
+  }
+
+  fn commit(&self) -> Result<Option<FeeRate>> {
+    self.commit_fee_rate.map(FeeRate::new).transpose()
+  }
+}
+
 #[derive(Args)]
 struct EstimateArgs {
   #[command(flatten)]
@@ -188,44 +200,46 @@ struct RecoverArgs {
 }
 
 struct App {
+  chain: Chain,
   network: Network,
   home: PathBuf,
-  esplora: Option<Esplora>,
-  ord: Option<Ord>,
+  client: Option<Client<ReqwestHttp>>,
 }
 
 impl App {
   fn new(cli: &Cli) -> Result<Self> {
-    let network = cli.network.network();
+    let network = cli.chain_network();
     let root = match &cli.home {
       Some(home) => home.clone(),
       None => std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".inscribe"))
         .ok_or_else(|| anyhow!("HOME is not set; use --home"))?,
     };
-    let esplora = match cli
+    let defaults = Endpoints::defaults(network);
+    let esplora = cli
       .esplora_url
-      .as_deref()
-      .or(api::default_esplora_url(network))
-    {
-      Some(url) => Some(Esplora::new(url)?),
-      None => None,
-    };
-    let ord = match cli.ord_url.as_deref().or(api::default_ord_url(network)) {
-      Some(url) => Some(Ord::new(url)?),
+      .clone()
+      .or_else(|| defaults.as_ref().map(|endpoints| endpoints.esplora.clone()));
+    let ord = cli.ord_url.clone().or_else(|| {
+      defaults
+        .as_ref()
+        .and_then(|endpoints| endpoints.ord.clone())
+    });
+    let client = match esplora {
+      Some(esplora) => Some(Client::new(ReqwestHttp::new()?, Endpoints { esplora, ord })),
       None => None,
     };
     Ok(Self {
+      chain: cli.network,
       network,
-      home: root.join(cli.network.dir()),
-      esplora,
-      ord,
+      home: root.join(cli.network.name()),
+      client,
     })
   }
 
-  fn esplora(&self) -> Result<&Esplora> {
+  fn client(&self) -> Result<&Client<ReqwestHttp>> {
     self
-      .esplora
+      .client
       .as_ref()
       .ok_or_else(|| anyhow!("no Esplora endpoint for this network; use --esplora-url"))
   }
@@ -235,27 +249,14 @@ impl App {
   }
 
   fn wallet(&self) -> Result<Wallet> {
-    Wallet::load(&self.home, self.network)
-  }
-
-  fn fee_rate(&self, explicit: Option<f64>) -> Result<FeeRate> {
-    match explicit {
-      Some(rate) => FeeRate::new(rate),
-      None => {
-        let fees = self
-          .esplora()?
-          .recommended_fees()
-          .context("get the recommended fee rate; or set --fee-rate")?;
-        FeeRate::new(fees.half_hour_fee)
-      }
-    }
+    store::load(&self.home, self.network)
   }
 
   fn fiat(&self, amount: Amount) -> String {
     if self.network != Network::Bitcoin {
       return String::new();
     }
-    match self.esplora.as_ref().map(|esplora| esplora.prices()) {
+    match self.client.as_ref().map(|client| block_on(client.prices())) {
       Some(Ok(prices)) => {
         let btc = amount.to_btc();
         format!(" (£{:.2}, ${:.2})", btc * prices.gbp, btc * prices.usd)
@@ -263,6 +264,24 @@ impl App {
       _ => String::new(),
     }
   }
+
+  fn load_run(&self, path: &Path) -> Result<Run> {
+    let run = Run::load(path)?;
+    if run.network != self.network {
+      bail!("the run is for {}, not {}", run.network, self.network);
+    }
+    Ok(run)
+  }
+}
+
+impl Cli {
+  fn chain_network(&self) -> Network {
+    self.network.network()
+  }
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+  pollster::block_on(future)
 }
 
 fn main() {
@@ -274,39 +293,39 @@ fn main() {
 
 fn run_cli() -> Result<()> {
   let cli = Cli::parse();
-  let ctx = App::new(&cli)?;
+  let app = App::new(&cli)?;
 
   match cli.command {
-    Command::Wallet(command) => wallet_command(&ctx, command),
-    Command::Estimate(args) => estimate(&ctx, args),
-    Command::Create(args) => create(&ctx, args),
-    Command::Broadcast { run } => broadcast(&ctx, &run),
-    Command::Status { run } => status(&ctx, &run),
-    Command::Recover(args) => recover(&ctx, args),
+    Command::Wallet(command) => wallet_command(&app, command),
+    Command::Estimate(args) => estimate(&app, args),
+    Command::Create(args) => create(&app, args),
+    Command::Broadcast { run } => broadcast(&app, &run),
+    Command::Status { run } => status(&app, &run),
+    Command::Recover(args) => recover(&app, args),
   }
 }
 
-fn wallet_command(ctx: &App, command: WalletCommand) -> Result<()> {
+fn wallet_command(app: &App, command: WalletCommand) -> Result<()> {
   match command {
     WalletCommand::Init => {
-      let (wallet, _mnemonic) = Wallet::create(&ctx.home, ctx.network)?;
+      let (wallet, _mnemonic) = store::create(&app.home, app.network)?;
       println!(
         "Saved a new mnemonic in {}",
-        inscribe::wallet::mnemonic_path(&ctx.home).display()
+        store::mnemonic_path(&app.home).display()
       );
       println!(
         "Back up the mnemonic now: inscribe --network {} wallet mnemonic",
-        network_arg(ctx.network)
+        app.chain.name()
       );
       println!("Funding address: {}", wallet.address());
       println!("Descriptor: {}", wallet.descriptor());
     }
-    WalletCommand::Address => println!("{}", ctx.wallet()?.address()),
-    WalletCommand::Descriptor => println!("{}", ctx.wallet()?.descriptor()),
-    WalletCommand::Mnemonic => println!("{}", Wallet::load_mnemonic(&ctx.home)?),
+    WalletCommand::Address => println!("{}", app.wallet()?.address()),
+    WalletCommand::Descriptor => println!("{}", app.wallet()?.descriptor()),
+    WalletCommand::Mnemonic => println!("{}", store::load_mnemonic(&app.home)?),
     WalletCommand::Balance => {
-      let wallet = ctx.wallet()?;
-      let utxos = ctx.esplora()?.utxos(&wallet.address())?;
+      let wallet = app.wallet()?;
+      let utxos = block_on(app.client()?.utxos(&wallet.address()))?;
       let mut confirmed = Amount::ZERO;
       let mut unconfirmed = Amount::ZERO;
       for utxo in &utxos {
@@ -319,151 +338,69 @@ fn wallet_command(ctx: &App, command: WalletCommand) -> Result<()> {
         };
         println!("{} {:>14} {state}", utxo.outpoint(), utxo.amount().to_sat());
       }
-      println!("Confirmed: {confirmed}{}", ctx.fiat(confirmed));
+      println!("Confirmed: {confirmed}{}", app.fiat(confirmed));
       println!("Unconfirmed: {unconfirmed}");
     }
   }
   Ok(())
 }
 
-fn network_arg(network: Network) -> &'static str {
-  match network {
-    Network::Bitcoin => "bitcoin",
-    Network::Signet => "signet",
-    Network::Testnet4 => "testnet4",
-    _ => "regtest",
-  }
+fn read_files(args: &ContentArgs) -> Result<service::Prepared> {
+  let files = args
+    .files
+    .iter()
+    .map(|path| {
+      Ok(FileInput {
+        name: path.display().to_string(),
+        bytes: std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+        content_type: args.content_type.clone(),
+      })
+    })
+    .collect::<Result<Vec<_>>>()?;
+  service::prepare(files, args.compress, args.metaprotocol.as_deref())
 }
 
-struct LoadedFiles {
-  inscriptions: Vec<Inscription>,
-  names: Vec<String>,
-  sha256: Vec<String>,
-}
-
-fn load_files(args: &ContentArgs) -> Result<LoadedFiles> {
-  let mut loaded = LoadedFiles {
-    inscriptions: Vec::new(),
-    names: Vec::new(),
-    sha256: Vec::new(),
+fn estimate(app: &App, args: EstimateArgs) -> Result<()> {
+  let prepared = read_files(&args.content)?;
+  let reveal_rate = match args.fees.reveal()? {
+    Some(rate) => rate,
+    None => block_on(service::fee_rate(app.client()?, None))?,
   };
-  for path in &args.files {
-    let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    loaded.sha256.push(run::sha256_hex(&raw));
-    loaded.names.push(path.display().to_string());
-    loaded.inscriptions.push(Inscription::from_file(
-      path,
-      args.content_type.as_deref(),
-      args.compress,
-      args.metaprotocol.as_deref(),
-    )?);
-  }
-  Ok(loaded)
-}
-
-fn estimate(ctx: &App, args: EstimateArgs) -> Result<()> {
-  let files = load_files(&args.content)?;
-  let reveal_rate = ctx.fee_rate(args.fees.fee_rate)?;
-  let commit_rate = match args.fees.commit_fee_rate {
-    Some(rate) => FeeRate::new(rate)?,
-    None => reveal_rate,
-  };
-
-  // A throwaway key and a P2TR placeholder give the exact reveal sizes. The
-  // commit estimate assumes one funding input and one change output.
+  let commit_rate = args.fees.commit()?.unwrap_or(reveal_rate);
   let secp = bitcoin::secp256k1::Secp256k1::new();
-  let placeholder = Address::p2tr(
+  let estimate = plan::estimate(
     &secp,
-    bitcoin::key::Keypair::new(&secp, &mut bitcoin::secp256k1::rand::thread_rng())
-      .x_only_public_key()
-      .0,
-    None,
-    ctx.network,
-  );
-  let wallet_key = bitcoin::key::Keypair::new(&secp, &mut bitcoin::secp256k1::rand::thread_rng());
-  let params = Params {
-    destination: placeholder.clone(),
-    change: placeholder,
-    postage: Amount::from_sat(args.content.postage),
-    commit_fee_rate: commit_rate,
-    reveal_fee_rate: reveal_rate,
-  };
-  let funding = [FundingUtxo {
-    outpoint: OutPoint::new(
-      bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
-      0,
-    ),
-    value: Amount::MAX_MONEY,
-  }];
-  let plan = plan::build(&secp, &wallet_key, &funding, files.inscriptions, &params)?;
+    prepared.inscriptions,
+    Amount::from_sat(args.content.postage),
+    commit_rate,
+    reveal_rate,
+  )?;
 
   println!(
     "Reveal fee rate {} sat/vB, commit fee rate {} sat/vB",
     reveal_rate.sat_per_vb(),
     commit_rate.sat_per_vb()
   );
-  for (reveal, name) in plan.reveals.iter().zip(&files.names) {
+  for (reveal, name) in estimate.reveals.iter().zip(&prepared.names) {
     println!(
       "{name}: {} bytes{}, reveal {} vB, fee {} sat",
-      reveal.inscription.body.len(),
-      if reveal.inscription.content_encoding.is_some() {
-        " (brotli)"
-      } else {
-        ""
-      },
-      reveal.tx.vsize(),
-      reveal.fee.to_sat()
+      reveal.body_bytes,
+      if reveal.compressed { " (brotli)" } else { "" },
+      reveal.vsize,
+      reveal.fee_sat
     );
   }
   println!(
     "Commit: {} vB, fee {} sat",
-    plan.commit.vsize(),
-    plan.commit_fee.to_sat()
+    estimate.commit_vsize, estimate.commit_fee_sat
   );
-  let fees = plan.total_spent();
-  println!("Network fees: {} sat{}", fees.to_sat(), ctx.fiat(fees));
+  let fees = Amount::from_sat(estimate.total_fee_sat);
+  println!("Network fees: {} sat{}", fees.to_sat(), app.fiat(fees));
   println!(
     "Postage held in the inscriptions: {} sat",
-    plan.total_postage().to_sat()
+    estimate.total_postage_sat
   );
   Ok(())
-}
-
-fn funding_utxos(ctx: &App, wallet: &Wallet, args: &CreateArgs) -> Result<Vec<FundingUtxo>> {
-  let utxos = ctx.esplora()?.utxos(&wallet.address())?;
-  let mut usable = Vec::new();
-  for utxo in utxos {
-    if !utxo.status.confirmed && !args.include_unconfirmed {
-      eprintln!("skip {}: no confirmation", utxo.outpoint());
-      continue;
-    }
-    if !args.no_ord_check {
-      let ord = ctx.ord.as_ref().ok_or_else(|| {
-        anyhow!(
-          "no ord server for this network; use --ord-url, or --no-ord-check on a test network"
-        )
-      })?;
-      match ord.utxo(&utxo.outpoint())? {
-        Some(info) if info.is_plain() => {}
-        Some(_) => {
-          eprintln!("skip {}: it holds an inscription or runes", utxo.outpoint());
-          continue;
-        }
-        None => {
-          eprintln!(
-            "skip {}: the ord server has not indexed it",
-            utxo.outpoint()
-          );
-          continue;
-        }
-      }
-    }
-    usable.push(FundingUtxo {
-      outpoint: utxo.outpoint(),
-      value: utxo.amount(),
-    });
-  }
-  Ok(usable)
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
@@ -474,54 +411,51 @@ fn confirm(prompt: &str) -> Result<bool> {
   Ok(line.trim() == "yes")
 }
 
-fn create(ctx: &App, args: CreateArgs) -> Result<()> {
-  let wallet = ctx.wallet()?;
+fn now_unix() -> u64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_secs())
+    .unwrap_or_default()
+}
+
+fn create(app: &App, args: CreateArgs) -> Result<()> {
+  let wallet = app.wallet()?;
   let destination = args
     .destination
     .clone()
-    .require_network(ctx.network)
+    .require_network(app.network)
     .context("the destination address is for a different network")?;
-  let files = load_files(&args.content)?;
-  let reveal_rate = ctx.fee_rate(args.fees.fee_rate)?;
-  let commit_rate = match args.fees.commit_fee_rate {
-    Some(rate) => FeeRate::new(rate)?,
-    None => reveal_rate,
-  };
-  let postage = Amount::from_sat(args.content.postage);
-
-  let funding = funding_utxos(ctx, &wallet, &args)?;
-  let params = Params {
+  let prepared = read_files(&args.content)?;
+  let options = CreateOptions {
     destination: destination.clone(),
-    change: wallet.address(),
-    postage,
-    commit_fee_rate: commit_rate,
-    reveal_fee_rate: reveal_rate,
+    postage: Amount::from_sat(args.content.postage),
+    reveal_fee_rate: args.fees.reveal()?,
+    commit_fee_rate: args.fees.commit()?,
+    include_unconfirmed: args.include_unconfirmed,
+    ord_check: !args.no_ord_check,
   };
-  let plan = plan::build(
-    wallet.secp(),
-    wallet.keypair(),
-    &funding,
-    files.inscriptions,
-    &params,
-  )?;
+  let created = block_on(service::create(
+    app.client()?,
+    &wallet,
+    prepared,
+    &options,
+    now_unix(),
+    &mut OsRng,
+  ))?;
+  for skipped in &created.skipped {
+    let reason = match skipped.reason {
+      SkipReason::Unconfirmed => "no confirmation",
+      SkipReason::HoldsInscriptionOrRunes => "it holds an inscription or runes",
+      SkipReason::NotIndexed => "the ord server has not indexed it",
+    };
+    eprintln!("skip {}: {reason}", skipped.outpoint);
+  }
 
-  let run = Run::from_plan(
-    &plan,
-    RunInputs {
-      network: ctx.network,
-      destination: destination.to_string(),
-      change_address: wallet.address().to_string(),
-      postage,
-      commit_fee_rate: commit_rate,
-      reveal_fee_rate: reveal_rate,
-      files: &files.names,
-      raw_sha256: &files.sha256,
-    },
-  );
-  let path = run.default_path(&ctx.runs_dir());
+  let run = created.run;
+  let path = run.default_path(&app.runs_dir());
   run.save(&path)?;
 
-  println!("Network: {}", network_arg(ctx.network));
+  println!("Network: {}", app.chain.name());
   println!("Destination: {destination}");
   for record in &run.reveals {
     println!(
@@ -533,21 +467,21 @@ fn create(ctx: &App, args: CreateArgs) -> Result<()> {
     "Commit {}: {} vB, fee {} sat",
     run.commit.txid, run.commit.vsize, run.commit.fee_sat
   );
-  if let Some(change) = plan.change {
+  if let Some(change) = created.plan.change {
     println!("Change to the wallet: {} sat", change.to_sat());
   }
-  let fees = plan.total_spent();
-  println!("Network fees: {} sat{}", fees.to_sat(), ctx.fiat(fees));
+  let fees = created.plan.total_spent();
+  println!("Network fees: {} sat{}", fees.to_sat(), app.fiat(fees));
   println!(
     "Postage held in the inscriptions: {} sat",
-    plan.total_postage().to_sat()
+    created.plan.total_postage().to_sat()
   );
   println!("Run file: {}", path.display());
 
   if args.dry_run {
     println!(
       "Dry run: nothing was broadcast. To broadcast later: inscribe --network {} broadcast {}",
-      network_arg(ctx.network),
+      app.chain.name(),
       path.display()
     );
     return Ok(());
@@ -556,143 +490,81 @@ fn create(ctx: &App, args: CreateArgs) -> Result<()> {
     println!("Nothing was broadcast. The run file stays for a later broadcast.");
     return Ok(());
   }
-  broadcast(ctx, &path)
+  broadcast(app, &path)
 }
 
-fn broadcast(ctx: &App, path: &Path) -> Result<()> {
-  let mut run = Run::load(path)?;
-  if run.network != ctx.network {
-    bail!("the run is for {}, not {}", run.network, ctx.network);
+fn broadcast(app: &App, path: &Path) -> Result<()> {
+  let mut run = app.load_run(path)?;
+  let result = block_on(service::broadcast(app.client()?, &mut run));
+  run.save(path)?;
+  let report = result?;
+  println!("Commit {} is in the network", report.commit_txid);
+  for id in &report.revealed {
+    println!("Reveal {id}");
   }
-  let esplora = ctx.esplora()?;
-
-  let commit_txid = run.commit.txid.parse()?;
-  if !run.commit.broadcast {
-    if esplora.tx_status(&commit_txid)?.is_none() {
-      esplora.broadcast(&run.commit.transaction()?)?;
-    }
-    run.commit.broadcast = true;
-    run.save(path)?;
+  for failure in &report.failures {
+    eprintln!("Reveal {} failed: {}", failure.file, failure.error);
   }
-  println!("Commit {} is in the network", run.commit.txid);
-
-  let mut failures = 0;
-  for index in 0..run.reveals.len() {
-    if run.reveals[index].tx.broadcast {
-      continue;
-    }
-    let txid = run.reveals[index].tx.txid.parse()?;
-    let result = match esplora.tx_status(&txid)? {
-      Some(_) => Ok(()),
-      None => esplora
-        .broadcast(&run.reveals[index].tx.transaction()?)
-        .map(|_| ()),
-    };
-    match result {
-      Ok(()) => {
-        run.reveals[index].tx.broadcast = true;
-        run.save(path)?;
-        println!(
-          "Reveal {} -> {}",
-          run.reveals[index].file, run.reveals[index].inscription_id
-        );
-      }
-      Err(err) => {
-        failures += 1;
-        eprintln!("Reveal {} failed: {err:#}", run.reveals[index].file);
-      }
-    }
-  }
-  if failures > 0 {
+  if !report.failures.is_empty() {
     bail!(
-      "{failures} reveal(s) failed. Run `broadcast` again, or `recover` to return the unrevealed commit outputs to the wallet."
+      "{} reveal(s) failed. Run `broadcast` again, or `recover` to return the unrevealed commit outputs to the wallet.",
+      report.failures.len()
     );
   }
   Ok(())
 }
 
-fn status(ctx: &App, path: &Path) -> Result<()> {
-  let run = Run::load(path)?;
-  let esplora = ctx.esplora()?;
-  let describe = |txid: &str| -> Result<String> {
-    Ok(match esplora.tx_status(&txid.parse()?)? {
-      None => "not in the network".to_string(),
-      Some(status) if status.confirmed => format!(
-        "confirmed at height {}",
-        status.block_height.unwrap_or_default()
-      ),
-      Some(_) => "in the mempool".to_string(),
-    })
-  };
+fn describe(state: &TxState) -> String {
+  match state {
+    TxState::NotInNetwork => "not in the network".into(),
+    TxState::Mempool => "in the mempool".into(),
+    TxState::Confirmed { height } => format!("confirmed at height {height}"),
+  }
+}
+
+fn status(app: &App, path: &Path) -> Result<()> {
+  let run = app.load_run(path)?;
+  let status = block_on(service::status(app.client()?, &run))?;
   println!(
     "Commit {}: {}",
-    run.commit.txid,
-    describe(&run.commit.txid)?
+    status.commit_txid,
+    describe(&status.commit)
   );
-  for record in &run.reveals {
+  for reveal in &status.reveals {
     println!(
       "{} {}: {}",
-      record.inscription_id,
-      record.file,
-      describe(&record.tx.txid)?
+      reveal.inscription_id,
+      reveal.file,
+      describe(&reveal.state)
     );
   }
-  if let Some(recovery) = &run.recovery {
-    println!("Recovery {}: {}", recovery.txid, describe(&recovery.txid)?);
+  if let Some(state) = &status.recovery {
+    println!("Recovery: {}", describe(state));
   }
   Ok(())
 }
 
-fn recover(ctx: &App, args: RecoverArgs) -> Result<()> {
-  let mut run = Run::load(&args.run)?;
-  if run.network != ctx.network {
-    bail!("the run is for {}, not {}", run.network, ctx.network);
-  }
-  let esplora = ctx.esplora()?;
-  let wallet = ctx.wallet()?;
-
-  let mut commits = Vec::new();
-  for record in &run.reveals {
-    let outpoint = record.commit_outpoint(&run.commit.txid)?;
-    if esplora.tx_status(&record.tx.txid.parse()?)?.is_some() {
-      continue;
-    }
-    if esplora.outspend(&outpoint)?.spent {
-      continue;
-    }
-    commits.push((
-      outpoint,
-      record.commit_output()?,
-      record.secret_key()?,
-      record.merkle_root()?,
-    ));
-  }
-  if commits.is_empty() {
+fn recover(app: &App, args: RecoverArgs) -> Result<()> {
+  let mut run = app.load_run(&args.run)?;
+  let wallet = app.wallet()?;
+  let client = app.client()?;
+  let rate = args.fee_rate.map(FeeRate::new).transpose()?;
+  let Some(recovery) = block_on(service::recovery(client, &wallet, &run, rate, &mut OsRng))? else {
     println!("Every commit output is revealed or spent. Nothing to recover.");
     return Ok(());
-  }
-
-  let rate = ctx.fee_rate(args.fee_rate)?;
-  let (tx, fee) = plan::build_recovery(wallet.secp(), &commits, &wallet.address(), rate)?;
+  };
   println!(
     "Recover {} commit output(s) to {}: {} sat after a fee of {} sat",
-    commits.len(),
+    recovery.outputs.len(),
     wallet.address(),
-    tx.output[0].value.to_sat(),
-    fee.to_sat()
+    recovery.tx.output[0].value.to_sat(),
+    recovery.fee.to_sat()
   );
   if !args.yes && !confirm("Broadcast the recovery transaction?")? {
     println!("Nothing was broadcast.");
     return Ok(());
   }
-  let txid = esplora.broadcast(&tx)?;
-  run.recovery = Some(run::TxRecord {
-    txid: txid.to_string(),
-    hex: bitcoin::consensus::encode::serialize_hex(&tx),
-    fee_sat: fee.to_sat(),
-    vsize: tx.vsize() as u64,
-    broadcast: true,
-  });
+  let txid = block_on(service::broadcast_recovery(client, &mut run, &recovery))?;
   run.save(&args.run)?;
   println!("Recovery {txid}");
   Ok(())

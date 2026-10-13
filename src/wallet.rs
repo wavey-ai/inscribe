@@ -1,13 +1,11 @@
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use bip39::Mnemonic;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv, Xpub};
 use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::secp256k1::All;
+use bitcoin::secp256k1::rand::{CryptoRng, RngCore};
 use bitcoin::{Address, Network, XOnlyPublicKey};
 
 /// A single-key BIP86 taproot wallet. The key at m/86'/coin'/0'/0/0 holds
@@ -21,10 +19,6 @@ pub struct Wallet {
   secp: Secp256k1<All>,
 }
 
-pub fn mnemonic_path(home: &Path) -> PathBuf {
-  home.join("mnemonic")
-}
-
 pub fn coin_type(network: Network) -> u32 {
   match network {
     Network::Bitcoin => 0,
@@ -32,39 +26,14 @@ pub fn coin_type(network: Network) -> u32 {
   }
 }
 
+/// A new 24-word mnemonic from 256 bits of entropy.
+pub fn generate_mnemonic<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Mnemonic> {
+  let mut entropy = [0u8; 32];
+  rng.fill_bytes(&mut entropy);
+  Ok(Mnemonic::from_entropy(&entropy)?)
+}
+
 impl Wallet {
-  pub fn create(home: &Path, network: Network) -> Result<(Self, Mnemonic)> {
-    let path = mnemonic_path(home);
-    if path.exists() {
-      bail!(
-        "{} exists; the wallet already has a mnemonic",
-        path.display()
-      );
-    }
-    fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
-
-    let mnemonic = Mnemonic::generate(24)?;
-    write_private(&path, format!("{mnemonic}\n").as_bytes())?;
-
-    Ok((Self::from_mnemonic(&mnemonic, network)?, mnemonic))
-  }
-
-  pub fn load(home: &Path, network: Network) -> Result<Self> {
-    let mnemonic = Self::load_mnemonic(home)?;
-    Self::from_mnemonic(&mnemonic, network)
-  }
-
-  pub fn load_mnemonic(home: &Path) -> Result<Mnemonic> {
-    let path = mnemonic_path(home);
-    let words = fs::read_to_string(&path).with_context(|| {
-      format!(
-        "read {}; run `inscribe wallet init` to make a wallet",
-        path.display()
-      )
-    })?;
-    Ok(Mnemonic::from_str(words.trim())?)
-  }
-
   pub fn from_mnemonic(mnemonic: &Mnemonic, network: Network) -> Result<Self> {
     let secp = Secp256k1::new();
     let master = Xpriv::new_master(network, &mnemonic.to_seed(""))?;
@@ -85,6 +54,10 @@ impl Wallet {
       keypair,
       secp,
     })
+  }
+
+  pub fn from_phrase(phrase: &str, network: Network) -> Result<Self> {
+    Self::from_mnemonic(&Mnemonic::from_str(phrase.trim())?, network)
   }
 
   pub fn network(&self) -> Network {
@@ -120,20 +93,71 @@ fn account_path(network: Network) -> DerivationPath {
   DerivationPath::from_str(&format!("m/86'/{coin}'/0'")).expect("valid derivation path")
 }
 
-pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-  let mut options = fs::OpenOptions::new();
-  options.write(true).create_new(true);
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
+/// Mnemonic storage in a data directory.
+#[cfg(feature = "native")]
+pub mod store {
+  use std::fs;
+  use std::io::Write;
+  use std::path::{Path, PathBuf};
+  use std::str::FromStr;
+
+  use anyhow::{Context, Result, bail};
+  use bip39::Mnemonic;
+  use bitcoin::Network;
+
+  use super::{Wallet, generate_mnemonic};
+
+  pub fn mnemonic_path(home: &Path) -> PathBuf {
+    home.join("mnemonic")
   }
-  let mut file = options
-    .open(path)
-    .with_context(|| format!("create {}", path.display()))?;
-  file.write_all(contents)?;
-  file.sync_all()?;
-  Ok(())
+
+  pub fn create(home: &Path, network: Network) -> Result<(Wallet, Mnemonic)> {
+    let path = mnemonic_path(home);
+    if path.exists() {
+      bail!(
+        "{} exists; the wallet already has a mnemonic",
+        path.display()
+      );
+    }
+    fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
+
+    let mnemonic = generate_mnemonic(&mut rand_core::OsRng)?;
+    write_private(&path, format!("{mnemonic}\n").as_bytes())?;
+
+    Ok((Wallet::from_mnemonic(&mnemonic, network)?, mnemonic))
+  }
+
+  pub fn load(home: &Path, network: Network) -> Result<Wallet> {
+    Wallet::from_mnemonic(&load_mnemonic(home)?, network)
+  }
+
+  pub fn load_mnemonic(home: &Path) -> Result<Mnemonic> {
+    let path = mnemonic_path(home);
+    let words = fs::read_to_string(&path).with_context(|| {
+      format!(
+        "read {}; run `inscribe wallet init` to make a wallet",
+        path.display()
+      )
+    })?;
+    Ok(Mnemonic::from_str(words.trim())?)
+  }
+
+  /// Creates a new file with owner-only permissions.
+  pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::OpenOptionsExt;
+      options.mode(0o600);
+    }
+    let mut file = options
+      .open(path)
+      .with_context(|| format!("create {}", path.display()))?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+  }
 }
 
 #[cfg(test)]
@@ -146,8 +170,7 @@ mod tests {
 
   #[test]
   fn first_receive_address_matches_bip86_vector() {
-    let wallet =
-      Wallet::from_mnemonic(&Mnemonic::from_str(MNEMONIC).unwrap(), Network::Bitcoin).unwrap();
+    let wallet = Wallet::from_phrase(MNEMONIC, Network::Bitcoin).unwrap();
     assert_eq!(
       wallet.address().to_string(),
       "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
@@ -156,22 +179,29 @@ mod tests {
   }
 
   #[test]
-  fn create_writes_a_private_mnemonic_once() {
+  fn generated_mnemonic_has_24_words() {
+    let mnemonic = generate_mnemonic(&mut rand_core::OsRng).unwrap();
+    assert_eq!(mnemonic.word_count(), 24);
+  }
+
+  #[cfg(feature = "native")]
+  #[test]
+  fn store_writes_a_private_mnemonic_once() {
     let dir = tempfile::tempdir().unwrap();
-    let (wallet, mnemonic) = Wallet::create(dir.path(), Network::Signet).unwrap();
+    let (wallet, mnemonic) = store::create(dir.path(), Network::Signet).unwrap();
     assert_eq!(mnemonic.word_count(), 24);
     assert!(wallet.address().to_string().starts_with("tb1p"));
-    assert!(Wallet::create(dir.path(), Network::Signet).is_err());
+    assert!(store::create(dir.path(), Network::Signet).is_err());
     #[cfg(unix)]
     {
       use std::os::unix::fs::PermissionsExt;
-      let mode = fs::metadata(mnemonic_path(dir.path()))
+      let mode = std::fs::metadata(store::mnemonic_path(dir.path()))
         .unwrap()
         .permissions()
         .mode();
       assert_eq!(mode & 0o777, 0o600);
     }
-    let loaded = Wallet::load(dir.path(), Network::Signet).unwrap();
+    let loaded = store::load(dir.path(), Network::Signet).unwrap();
     assert_eq!(loaded.address(), wallet.address());
   }
 }

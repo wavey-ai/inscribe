@@ -1,7 +1,9 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+#[cfg(feature = "native")]
+use anyhow::Context;
+use anyhow::{Result, anyhow, bail, ensure};
 use bitcoin::XOnlyPublicKey;
 use bitcoin::blockdata::constants::MAX_SCRIPT_ELEMENT_SIZE;
 use bitcoin::opcodes;
@@ -78,11 +80,12 @@ const TABLE: &[(&str, Mode, &[&str])] = &[
   ("video/webm", Mode::Generic, &["webm"]),
 ];
 
-pub fn content_type_for_path(path: &Path) -> Result<(&'static str, Mode)> {
-  let extension = path
+/// The content type and brotli mode for a file name, from its extension.
+pub fn content_type_for_name(name: &str) -> Result<(&'static str, Mode)> {
+  let extension = Path::new(name)
     .extension()
     .and_then(|extension| extension.to_str())
-    .ok_or_else(|| anyhow!("{} has no file extension", path.display()))?
+    .ok_or_else(|| anyhow!("{name} has no file extension"))?
     .to_lowercase();
 
   TABLE
@@ -90,14 +93,12 @@ pub fn content_type_for_path(path: &Path) -> Result<(&'static str, Mode)> {
     .find(|(_, _, extensions)| extensions.contains(&extension.as_str()))
     .map(|(content_type, mode, _)| (*content_type, *mode))
     .ok_or_else(|| {
-      anyhow!(
-        "{}: the extension .{extension} has no known content type; set --content-type",
-        path.display()
-      )
+      anyhow!("{name}: the extension .{extension} has no known content type; set the content type")
     })
 }
 
-fn mode_for_content_type(content_type: &str) -> Mode {
+/// The brotli mode for a content type. Unknown types use the generic mode.
+pub fn mode_for_content_type(content_type: &str) -> Mode {
   TABLE
     .iter()
     .find(|(known, _, _)| *known == content_type)
@@ -114,6 +115,24 @@ pub struct Inscription {
 }
 
 impl Inscription {
+  /// An inscription from a file name and its bytes. The content type comes
+  /// from the extension when `content_type` is None.
+  pub fn from_named_bytes(
+    name: &str,
+    body: Vec<u8>,
+    content_type: Option<&str>,
+    compress: bool,
+    metaprotocol: Option<&str>,
+  ) -> Result<Self> {
+    let (content_type, mode) = match content_type {
+      Some(content_type) => (content_type, mode_for_content_type(content_type)),
+      None => content_type_for_name(name)?,
+    };
+
+    Self::new(content_type, body, compress, mode, metaprotocol)
+  }
+
+  #[cfg(feature = "native")]
   pub fn from_file(
     path: &Path,
     content_type: Option<&str>,
@@ -121,13 +140,13 @@ impl Inscription {
     metaprotocol: Option<&str>,
   ) -> Result<Self> {
     let body = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-
-    let (content_type, mode) = match content_type {
-      Some(content_type) => (content_type, mode_for_content_type(content_type)),
-      None => content_type_for_path(path)?,
-    };
-
-    Self::new(content_type, body, compress, mode, metaprotocol)
+    Self::from_named_bytes(
+      &path.to_string_lossy(),
+      body,
+      content_type,
+      compress,
+      metaprotocol,
+    )
   }
 
   pub fn new(
@@ -245,10 +264,10 @@ mod tests {
       ("a.flac", "audio/flac"),
     ];
     for (path, expected) in cases {
-      assert_eq!(content_type_for_path(Path::new(path)).unwrap().0, expected);
+      assert_eq!(content_type_for_name(path).unwrap().0, expected);
     }
-    assert!(content_type_for_path(Path::new("a.unknownext")).is_err());
-    assert!(content_type_for_path(Path::new("noextension")).is_err());
+    assert!(content_type_for_name("a.unknownext").is_err());
+    assert!(content_type_for_name("noextension").is_err());
   }
 
   #[test]

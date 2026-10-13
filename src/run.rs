@@ -1,6 +1,7 @@
+#[cfg(feature = "native")]
 use std::fs;
+#[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
@@ -57,13 +58,13 @@ pub struct RevealRecord {
 }
 
 impl TxRecord {
-  fn new(tx: &Transaction, fee: Amount) -> Self {
+  pub fn new(tx: &Transaction, fee: Amount, broadcast: bool) -> Self {
     Self {
       txid: tx.compute_txid().to_string(),
       hex: serialize_hex(tx),
       fee_sat: fee.to_sat(),
       vsize: tx.vsize() as u64,
-      broadcast: false,
+      broadcast,
     }
   }
 
@@ -105,7 +106,9 @@ pub struct RunInputs<'a> {
 }
 
 impl Run {
-  pub fn from_plan(plan: &Plan, inputs: RunInputs) -> Self {
+  /// `created_unix` is the time in seconds since the Unix epoch. The caller
+  /// supplies it, because WebAssembly hosts have no system clock in std.
+  pub fn from_plan(plan: &Plan, inputs: RunInputs, created_unix: u64) -> Self {
     let reveals = plan
       .reveals
       .iter()
@@ -126,28 +129,41 @@ impl Run {
         commit_script_pubkey: reveal.commit_output.script_pubkey.to_hex_string(),
         secret_key: reveal.secret_key.display_secret().to_string(),
         merkle_root: reveal.merkle_root.to_string(),
-        tx: TxRecord::new(&reveal.tx, reveal.fee),
+        tx: TxRecord::new(&reveal.tx, reveal.fee, false),
       })
       .collect();
 
     Self {
       format: 1,
       network: inputs.network,
-      created_unix: SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default(),
+      created_unix,
       destination: inputs.destination,
       change_address: inputs.change_address,
       postage_sat: inputs.postage.to_sat(),
       commit_fee_rate: inputs.commit_fee_rate.sat_per_vb(),
       reveal_fee_rate: inputs.reveal_fee_rate.sat_per_vb(),
-      commit: TxRecord::new(&plan.commit, plan.commit_fee),
+      commit: TxRecord::new(&plan.commit, plan.commit_fee, false),
       reveals,
       recovery: None,
     }
   }
 
+  /// A copy with the commit-output secret keys removed, for API responses
+  /// and logs.
+  pub fn without_secrets(&self) -> Self {
+    let mut run = self.clone();
+    for reveal in &mut run.reveals {
+      reveal.secret_key.clear();
+    }
+    run
+  }
+
+  /// A stable identifier: the creation time and the start of the commit txid.
+  pub fn id(&self) -> String {
+    format!("{}-{}", self.created_unix, &self.commit.txid[..16])
+  }
+
+  #[cfg(feature = "native")]
   pub fn default_path(&self, runs_dir: &Path) -> PathBuf {
     runs_dir.join(format!(
       "{}-{}.json",
@@ -156,19 +172,21 @@ impl Run {
     ))
   }
 
+  #[cfg(feature = "native")]
   pub fn load(path: &Path) -> Result<Self> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("decode {}", path.display()))
   }
 
   /// Writes the file with owner-only permissions and replaces it atomically.
+  #[cfg(feature = "native")]
   pub fn save(&self, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
     let _ = fs::remove_file(&tmp);
-    crate::wallet::write_private(&tmp, serde_json::to_string_pretty(self)?.as_bytes())?;
+    crate::wallet::store::write_private(&tmp, serde_json::to_string_pretty(self)?.as_bytes())?;
     fs::rename(&tmp, path)
       .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
   }
